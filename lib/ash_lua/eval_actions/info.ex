@@ -35,6 +35,33 @@ defmodule AshLua.EvalActions.Info do
     do: Extension.get_opt(resource, [:eval_actions], :forbidden_fields, :hide)
 
   @doc """
+  Optional `{module, function}` resolving runtime action entrypoints from the
+  action context for both the `:eval` and `:docs` actions. `nil` when unset.
+  """
+  @spec entrypoints_resolver(Ash.Resource.t() | Spark.Dsl.t()) ::
+          {module(), atom()} | nil
+  def entrypoints_resolver(resource),
+    do: Extension.get_opt(resource, [:eval_actions], :entrypoints_resolver, nil)
+
+  @doc """
+  Optional `{module, function}` supplying the base `%Lua{}` VM for the
+  synthesized `:eval` action. `nil` when unset.
+  """
+  @spec lua_init(Ash.Resource.t() | Spark.Dsl.t()) :: {module(), atom()} | nil
+  def lua_init(resource),
+    do: Extension.get_opt(resource, [:eval_actions], :lua_init, nil)
+
+  @doc """
+  Optional execution timeout for the `:eval` action: a static positive
+  integer or `{module, function}` returning the default from the action
+  context. `nil` disables timeout enforcement.
+  """
+  @spec timeout_ms(Ash.Resource.t() | Spark.Dsl.t()) ::
+          pos_integer() | {module(), atom()} | nil
+  def timeout_ms(resource),
+    do: Extension.get_opt(resource, [:eval_actions], :timeout_ms, nil)
+
+  @doc """
   OTP app to scan when building the manifest for `:eval` / `:docs`.
 
   Falls back to the resource's domain's `:otp_app` when not explicitly configured.

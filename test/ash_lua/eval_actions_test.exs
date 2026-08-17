@@ -119,7 +119,11 @@ defmodule AshLua.EvalActionsTest do
         })
 
       assert {:ok, %{result: nil, error: err}} = Ash.run_action(input)
-      assert [%{"code" => "lua_error", "vars" => vars} | _] = err["errors"]
+
+      # Fork extension: compiler failures classify distinctly — code
+      # lua_syntax_error, library diagnostic led by a single prefix.
+      assert [%{"code" => "lua_syntax_error", "vars" => vars} | _] = err["errors"]
+      assert String.starts_with?(err["message"], "Lua syntax error: ")
       refute String.contains?(err["message"], <<27>>)
       assert is_integer(vars["line"])
       assert is_map(vars["source_context"])

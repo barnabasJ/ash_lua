@@ -241,20 +241,35 @@ defmodule AshLua.Eval do
   defp format_lua_error(%Lua.CompilerException{} = e, script, source) do
     case Lua.Parser.parse_structured(script) do
       {:error, [parse_error | _]} ->
-        parse_error
-        |> Lua.Parser.Error.to_map(script)
-        |> json_safe()
-        |> maybe_put_lua_source(source)
-        |> lua_error_envelope()
+        vars =
+          parse_error
+          |> Lua.Parser.Error.to_map(script)
+          |> json_safe()
+          |> maybe_put_lua_source(source)
+
+        classified("lua_syntax_error", e, vars)
 
       _ ->
-        lua_error_envelope(Exception.message(e), %{})
+        classified("lua_syntax_error", e, %{})
     end
   end
 
   defp format_lua_error(%Lua.RuntimeException{original: original} = e, script, source) do
     vars = structured_runtime_error(original, script, source)
-    lua_error_envelope(Exception.message(e), vars)
+    classified("lua_runtime_error", e, vars)
+  end
+
+  # Classified envelope: stable branchable code per failure class, library
+  # message led by a single classification prefix for the compiler case (the
+  # runtime case already carries its own `Lua runtime error: ` lead — forwarded
+  # verbatim, never re-prefixed).
+  defp classified("lua_syntax_error" = code, %Lua.CompilerException{} = e, vars) do
+    message = String.trim("Lua syntax error: " <> String.trim(Exception.message(e)))
+    lua_error_envelope(message, code, vars)
+  end
+
+  defp classified(code, %Lua.RuntimeException{} = e, vars) do
+    lua_error_envelope(String.trim(Exception.message(e)), code, vars)
   end
 
   defp structured_runtime_error(%{__struct__: module} = original, script, source) do
@@ -277,18 +292,14 @@ defmodule AshLua.Eval do
   defp maybe_put_lua_source(%{"source" => ""} = vars, source), do: %{vars | "source" => source}
   defp maybe_put_lua_source(vars, _source), do: vars
 
-  defp lua_error_envelope(%{"message" => message} = vars) when is_binary(message) do
-    lua_error_envelope(message, vars)
-  end
-
-  defp lua_error_envelope(message, vars) do
+  defp lua_error_envelope(message, code, vars) when is_binary(message) and is_binary(code) do
     %{
       "message" => message,
       "errors" => [
         %{
           "message" => message,
-          "short_message" => "lua_error",
-          "code" => "lua_error",
+          "short_message" => code,
+          "code" => code,
           "fields" => [],
           "vars" => vars
         }

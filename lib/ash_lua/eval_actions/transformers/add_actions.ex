@@ -10,6 +10,14 @@ defmodule AshLua.EvalActions.Transformers.AddActions do
   alias Ash.Resource.Builder
   alias AshLua.EvalActions.Info
 
+  # The synthesized actions are added EARLY (no `after?(_) -> true` catch-all)
+  # so that downstream transformers and other extensions — e.g. action
+  # wrappers generated from the resource's final action set — can see and bind
+  # to the synthesized `:eval`/`:docs` actions. Transformers that must run
+  # after everything else still do: they declare their own `after?` clauses,
+  # which outrank this transformer's neutral ordering.
+  def after?(_), do: false
+
   def transform(dsl_state) do
     eval_name = Info.eval_action_name(dsl_state)
     docs_name = Info.docs_action_name(dsl_state)
@@ -19,10 +27,10 @@ defmodule AshLua.EvalActions.Transformers.AddActions do
     end
   end
 
-  def after?(_), do: true
-
   defp add_eval_action(dsl_state, name) do
-    with {:ok, script_arg} <- Builder.build_action_argument(:script, :string, allow_nil?: false) do
+    with {:ok, script_arg} <- Builder.build_action_argument(:script, :string, allow_nil?: false),
+         {:ok, timeout_arg} <-
+           Builder.build_action_argument(:timeout_ms, :integer, allow_nil?: true) do
       Builder.add_new_action(dsl_state, :action, name,
         returns: :map,
         constraints: [
@@ -32,7 +40,7 @@ defmodule AshLua.EvalActions.Transformers.AddActions do
             print_output: [type: {:array, :string}, allow_nil?: true]
           ]
         ],
-        arguments: [script_arg],
+        arguments: [script_arg, timeout_arg],
         run: AshLua.EvalActions.Run.Eval
       )
     end

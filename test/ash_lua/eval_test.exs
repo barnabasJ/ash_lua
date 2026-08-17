@@ -68,8 +68,12 @@ defmodule AshLua.EvalTest do
                lua_options: [max_instructions: 1_000]
              )
 
-    assert [%{"code" => "lua_error"} | _] = err["errors"]
+    # Fork extension: runtime failures classify distinctly from compiler
+    # failures — code lua_runtime_error, library message forwarded verbatim.
+    assert [%{"code" => "lua_runtime_error"} | _] = err["errors"]
     assert err["message"] =~ "instruction budget exceeded"
+    assert String.starts_with?(err["message"], "Lua runtime error: ")
+    refute err["message"] =~ "Lua runtime error: Lua runtime error"
   end
 
   test "run/2 returns structured Lua syntax errors" do
@@ -83,7 +87,11 @@ defmodule AshLua.EvalTest do
                source: "agent_script.lua"
              )
 
-    assert [%{"code" => "lua_error", "vars" => vars} | _] = err["errors"]
+    # Fork extension: compiler failures classify distinctly — code
+    # lua_syntax_error, library diagnostic led by a single prefix.
+    assert [%{"code" => "lua_syntax_error", "vars" => vars} | _] = err["errors"]
+    assert String.starts_with?(err["message"], "Lua syntax error: ")
+    refute err["message"] =~ "Lua syntax error: Lua syntax error"
     refute String.contains?(err["message"], <<27>>)
     assert vars["type"] == "unexpected_token"
     assert vars["source"] == "agent_script.lua"

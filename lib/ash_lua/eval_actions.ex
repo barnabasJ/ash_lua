@@ -79,6 +79,43 @@ defmodule AshLua.EvalActions do
         default: :hide,
         doc:
           "How to render fields hidden by authorization in `:eval` results. `:hide` (default) strips them; `:display` renders them as the opaque marker `%{\"opaque\" => \"forbidden\"}` so the agent can tell a forbidden field apart from an absent one."
+      ],
+      entrypoints_resolver: [
+        type: {:tuple, [:atom, :atom]},
+        doc: """
+        `{module, function}` resolving the runtime action entrypoints from the
+        action context. The function receives the action implementation context
+        map (actor, tenant, source_context, ...) and returns a list of
+        `{resource, action}` tuples that filter the manifest for both the
+        synthesized `:eval` and `:docs` actions. `nil` (the default) uses the
+        statically configured surface (labels / `resource` entries); a resolver
+        returning `nil` also falls back to the static surface, while `[]`
+        deliberately exposes an empty surface (default-deny). Resolver-scoped
+        surfaces bypass the eval-manifest cache — they are per-call.
+        """
+      ],
+      lua_init: [
+        type: {:tuple, [:atom, :atom]},
+        doc: """
+        `{module, function}` supplying the base `%Lua{}` VM the bindings are
+        installed on. The function receives the action implementation context
+        map and returns a `%Lua{}` (e.g. an application-hardened VM with
+        dangerous stdlib entries removed). `nil` (the default) builds a plain
+        `Lua.new/0`.
+        """
+      ],
+      timeout_ms: [
+        type: {:or, [:pos_integer, {:tuple, [:atom, :atom]}]},
+        doc: """
+        Execution timeout for the synthesized `:eval` action, in milliseconds.
+        A positive integer is a static default; `{module, function}` receives
+        the action implementation context and returns the default (used when
+        the action's optional `timeout_ms` argument is not supplied).
+        `nil` (the default) disables timeout enforcement entirely. On timeout
+        the script task is brutally killed and the failure rides the action's
+        typed `error` slot with code `lua_script_timeout` (message names the
+        limit).
+        """
       ]
     ],
     entities: [@expose]
@@ -102,6 +139,10 @@ defmodule AshLua.EvalActions do
   the script body and the documentation rendering are constrained to the
   configured action labels, and every Ash call inside the Lua script flows
   through the standard authorization machinery.
+
+  The surface can additionally be scoped per call through
+  `entrypoints_resolver`, hardened through the `lua_init` base-VM hook, and
+  time-bounded through `timeout_ms` — see the section schema.
   """
 
   use Spark.Dsl.Extension,
