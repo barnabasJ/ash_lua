@@ -11,6 +11,62 @@ See [Conventional Commits](Https://conventionalcommits.org) for commit guideline
 
 <!-- changelog -->
 
+## [v0.2.3](https://github.com/ash-project/ash_lua/compare/v0.2.2...v0.2.3) (2026-09-23)
+
+
+
+
+### Improvements:
+
+* options to force pagination on reads by [@zachdaniel](https://github.com/zachdaniel)
+
+* add new abridged documentation as default read by [@zachdaniel](https://github.com/zachdaniel)
+
+* validate non-overlapping type names by [@zachdaniel](https://github.com/zachdaniel)
+
+### Bug Fixes:
+
+* return host exceptions and query input errors to scripts as structured errors by [@zachdaniel](https://github.com/zachdaniel)
+
+* properly split read inputs in `input` by [@zachdaniel](https://github.com/zachdaniel)
+
+## [v0.2.2](https://github.com/ash-project/ash_lua/compare/v0.2.1...v0.2.2) (2026-09-08)
+
+
+
+
+### Bug Fixes:
+
+* authorize aggregated fields on the read operation path (CVE-2026-78216) by [@zachdaniel](https://github.com/zachdaniel)
+
+## [v0.2.1](https://github.com/ash-project/ash_lua/compare/v0.2.0...v0.2.1) (2026-09-07)
+
+
+
+
+### Bug Fixes:
+
+* enforce the exposed-field allow-list on the read operation path (CVE-2026-82586) by [@zachdaniel](https://github.com/zachdaniel)
+
+## [v0.2.0](https://github.com/ash-project/ash_lua/compare/v0.1.6...v0.2.0) (2026-08-27)
+
+
+
+
+### Features:
+
+* Expose generic eval runtime (#6) by olivermt [(#6)](https://github.com/ash-project/ash_lua/pull/6)
+
+### Bug Fixes:
+
+* don't drop entrypoints from manifest when using multiple otp apps by [@zachdaniel](https://github.com/zachdaniel)
+
+### Improvements:
+
+* Migrate to lua 1.0 (#9) by Dave Lucia [(#9)](https://github.com/ash-project/ash_lua/pull/9)
+
+* Prepare native Lua release candidate (#5) by olivermt [(#5)](https://github.com/ash-project/ash_lua/pull/5)
+
 ## [v0.1.6](https://github.com/ash-project/ash_lua/compare/v0.1.5...v0.1.6) (2026-06-10)
 
 

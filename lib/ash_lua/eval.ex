@@ -37,6 +37,8 @@ defmodule AshLua.Eval do
           | {:tenant, term()}
           | {:context, map()}
           | {:forbidden_fields, :hide | :display}
+          | {:require_pagination?, boolean()}
+          | {:default_page_size, pos_integer()}
           | {:lua, Lua.t()}
           | {:lua_options, keyword()}
           | {:source, String.t()}
@@ -113,9 +115,16 @@ defmodule AshLua.Eval do
   Returns the same stable shape as the synthesized `:eval` action:
   `%{result: term, error: map | nil, print_output: [String.t()]}`.
 
+  `error` is the error table the script returned as its second value,
+  converted to plain maps and lists at every depth (so it is JSON-encodable).
+  When the script itself fails — a syntax error, a Lua runtime error, an
+  exceeded safety budget — or returns a non-table error value, `error` is an
+  envelope with `class = "lua_error"`, a single `errors` entry whose `code` is
+  `"lua_error"`, and (since there is exactly one entry) a top-level `message`.
+
   The surface is resolved with `manifest/1`. Runtime options include
-  `:actor`, `:tenant`, `:context`, `:forbidden_fields`, `:source`, `:lua`, and
-  `:lua_options`. `:lua_options` is forwarded to `Lua.new/1` when a prebuilt
+  `:actor`, `:tenant`, `:context`, `:forbidden_fields`, `:require_pagination?`,
+  `:default_page_size`, `:source`, `:lua`, and `:lua_options`. `:lua_options` is forwarded to `Lua.new/1` when a prebuilt
   `:lua` VM is not supplied.
   """
   @spec run(String.t(), run_opts()) :: {:ok, run_result()} | {:error, term()}
@@ -130,9 +139,9 @@ defmodule AshLua.Eval do
   @doc """
   Returns markdown documentation for a scoped AshLua surface.
 
-  Pass neither `:name` nor `:search` for the compact index. Pass
-  `name: "full"` for the full page, a callable/type/topic id for a focused
-  page, or `search: term` for ranked search results.
+  Pass neither `:name` nor `:search` (or `name: "abridged"`) for one line per
+  operation. Pass `name: "full"` for the full page, a callable/type/topic id
+  for a focused page, or `search: term` for ranked search results.
   """
   @spec docs(Manifest.t() | manifest_opts(), keyword() | map()) ::
           {:ok, String.t()} | {:error, term()}
@@ -164,6 +173,8 @@ defmodule AshLua.Eval do
       context: Keyword.get(opts, :context, %{}) || %{},
       forbidden_fields: forbidden_fields
     ]
+    |> maybe_put(:require_pagination?, Keyword.get(opts, :require_pagination?))
+    |> maybe_put(:default_page_size, Keyword.get(opts, :default_page_size))
     |> maybe_put(:lua, Keyword.get(opts, :lua))
     |> maybe_put(:lua_options, Keyword.get(opts, :lua_options))
     |> maybe_put(:source, Keyword.get(opts, :source))
@@ -234,9 +245,48 @@ defmodule AshLua.Eval do
   defp split_lua_return([nil, err | _]), do: {nil, normalize_error(err)}
   defp split_lua_return([value, err | _]), do: {value, normalize_error(err)}
 
-  defp normalize_error(err) when is_list(err), do: Map.new(err)
-  defp normalize_error(err) when is_map(err), do: err
-  defp normalize_error(err), do: %{"message" => inspect(err)}
+  # The error slot of a `(result, err)` return is a Lua table; convert it at
+  # every depth (like the result slot) so `errors` is a list of maps and the
+  # whole thing is JSON-encodable. A script may also hand back a bare value
+  # (`return nil, "oops"`) — wrap that in the same envelope used for script
+  # failures.
+  defp normalize_error(err) when is_list(err) or is_map(err) do
+    case deep_decode(err) do
+      %{} = envelope -> normalize_envelope(envelope)
+      other -> lua_error_envelope(scalar_error_message(other), %{})
+    end
+  end
+
+  defp normalize_error(err), do: lua_error_envelope(scalar_error_message(err), %{})
+
+  defp deep_decode(%{} = map) do
+    Map.new(map, fn {k, v} -> {to_string(k), AshLua.Encoder.decode_input(v)} end)
+  end
+
+  defp deep_decode(list) when is_list(list), do: AshLua.Encoder.decode_input(list)
+
+  # An empty Lua table decodes as `%{}`; the envelope's list-valued keys must
+  # come back as lists regardless.
+  defp normalize_envelope(envelope) do
+    Map.replace_lazy(envelope, "errors", fn
+      errors when is_list(errors) -> Enum.map(errors, &normalize_error_leaf/1)
+      _ -> []
+    end)
+  end
+
+  defp normalize_error_leaf(%{} = leaf) do
+    Map.update(leaf, "fields", [], fn
+      fields when is_list(fields) -> fields
+      _ -> []
+    end)
+  end
+
+  defp normalize_error_leaf(other), do: other
+
+  defp scalar_error_message(value) when is_binary(value), do: value
+  defp scalar_error_message(value) when is_number(value), do: to_string(value)
+  defp scalar_error_message(value) when is_boolean(value), do: to_string(value)
+  defp scalar_error_message(value), do: inspect(value)
 
   defp format_lua_error(%Lua.CompilerException{} = e, script, source) do
     case Lua.Parser.parse_structured(script) do
@@ -281,8 +331,13 @@ defmodule AshLua.Eval do
     lua_error_envelope(message, vars)
   end
 
+  # Script-level failures get their own `class` so callers can tell "the
+  # script broke" apart from "an Ash call failed". Unlike Ash call errors this
+  # envelope always holds exactly one entry, so a top-level `message` cannot
+  # misrepresent it and is kept as a convenience.
   defp lua_error_envelope(message, vars) do
     %{
+      "class" => "lua_error",
       "message" => message,
       "errors" => [
         %{
@@ -354,8 +409,8 @@ defmodule AshLua.Eval do
     {:ok, AshLua.Docs.search(manifest, search)}
   end
 
-  defp dispatch_docs(manifest, name, _search) when name in [nil, ""] do
-    {:ok, AshLua.Docs.index_doc(manifest)}
+  defp dispatch_docs(manifest, name, _search) when name in [nil, "", "abridged"] do
+    {:ok, AshLua.Docs.abridged_doc(manifest)}
   end
 
   defp dispatch_docs(manifest, "full", _search) do

@@ -9,6 +9,8 @@ defmodule AshLua.Test.Posts.Post do
     data_layer: Ash.DataLayer.Ets,
     extensions: [AshLua.Resource]
 
+  require Ash.Query
+
   ets do
     private? true
   end
@@ -19,6 +21,27 @@ defmodule AshLua.Test.Posts.Post do
     update :publish do
       accept []
       change set_attribute(:published, true)
+    end
+
+    # An argument that shares its name with a reserved query control. The
+    # runtime must deliver it to the action rather than treat it as `limit`.
+    read :search do
+      argument :limit, :integer
+
+      prepare fn query, _context ->
+        case Ash.Query.get_argument(query, :limit) do
+          nil -> query
+          limit -> Ash.Query.filter(query, expr(string_length(title) <= ^limit))
+        end
+      end
+    end
+
+    # Raises from inside the action so tests can check that a host exception
+    # is returned to the script as a structured error rather than aborting it.
+    action :explode, :integer do
+      run fn _input, _context ->
+        raise "kaboom: this text must not reach the script"
+      end
     end
 
     action :word_count, :integer do
@@ -50,6 +73,11 @@ defmodule AshLua.Test.Posts.Post do
     attribute :published, :boolean do
       default false
       public? true
+    end
+
+    attribute :secret, :string do
+      public? false
+      sensitive? true
     end
 
     attribute :status, AshLua.Test.Posts.Post.Status do

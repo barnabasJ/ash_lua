@@ -31,8 +31,8 @@ defmodule AshLua.Encoder do
   Lua tables decode as a list of two-tuples — keyed by integers for sequences and by
   strings for maps. We normalize:
 
-    * integer-keyed (sequence) tables → plain lists, sorted by index
-    * string-keyed tables → maps with string keys (Ash accepts string-keyed params)
+    * contiguous integer keys starting at one → plain lists, sorted by index
+    * sparse or mixed keys → maps with string keys (Ash accepts string-keyed params)
     * empty tables → empty maps (Ash actions are always invoked with a map of params)
 
   Recurses into values.
@@ -44,7 +44,7 @@ defmodule AshLua.Encoder do
 
   def decode_input(list) when is_list(list) do
     cond do
-      integer_keyed?(list) ->
+      sequence_table?(list) ->
         list
         |> Enum.sort_by(fn {k, _v} -> k end)
         |> Enum.map(fn {_k, v} -> decode_input(v) end)
@@ -59,14 +59,17 @@ defmodule AshLua.Encoder do
 
   def decode_input(other), do: other
 
-  defp integer_keyed?([{k, _} | _] = list) when is_integer(k) do
-    Enum.all?(list, fn
-      {k, _} -> is_integer(k)
+  defp sequence_table?([{k, _} | _] = list) when is_integer(k) do
+    list
+    |> Enum.sort()
+    |> Enum.with_index(1)
+    |> Enum.all?(fn
+      {{key, _value}, index} -> key === index
       _ -> false
     end)
   end
 
-  defp integer_keyed?(_), do: false
+  defp sequence_table?(_), do: false
 
   defp keyword_pairs?([{_, _} | _] = list) do
     Enum.all?(list, &match?({_, _}, &1))
@@ -151,7 +154,7 @@ defmodule AshLua.Encoder do
   # tree.
   def encode_result(value) when is_list(value) do
     cond do
-      integer_keyed?(value) ->
+      sequence_table?(value) ->
         value
         |> Enum.sort_by(fn {k, _v} -> k end)
         |> Enum.map(fn {_k, v} -> encode_result(v) end)
@@ -214,7 +217,7 @@ defmodule AshLua.Encoder do
     record
     |> Map.from_struct()
     |> Enum.reject(fn {k, _v} -> skip_struct_field?(k) end)
-    |> Enum.into(%{}, fn {k, v} ->
+    |> Map.new(fn {k, v} ->
       {Atom.to_string(k), encode_field(v)}
     end)
   end
@@ -347,7 +350,7 @@ defmodule AshLua.Encoder do
 
   def encode_with_template(tuple, {:tuple, entries}) when is_tuple(tuple) do
     Map.new(entries, fn {:tuple_field, name, idx, sub} ->
-      value = if idx < tuple_size(tuple), do: elem(tuple, idx), else: nil
+      value = if idx < tuple_size(tuple), do: elem(tuple, idx)
       {Atom.to_string(name), encode_with_template(value, sub)}
     end)
   end
@@ -530,6 +533,8 @@ defmodule AshLua.Encoder do
   defp stringify_var_value(value), do: inspect(value)
 
   defp log_unknown_error(error) do
+    require Logger
+
     uuid = Ash.UUID.generate()
 
     stacktrace =
@@ -537,8 +542,6 @@ defmodule AshLua.Encoder do
         %{stacktrace: %{stacktrace: v}} -> v
         _ -> nil
       end
-
-    require Logger
 
     Logger.warning(
       "`#{uuid}`: AshLua.Error not implemented for error:\n\n#{Exception.format(:error, error, stacktrace)}"

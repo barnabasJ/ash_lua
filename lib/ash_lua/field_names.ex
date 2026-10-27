@@ -135,17 +135,11 @@ defmodule AshLua.FieldNames do
   end
 
   defp to_internal_action_input_key(resource, action_name, action_type, key) do
-    argument_name = to_internal_argument_name(resource, action_name, key)
-
-    cond do
-      argument_name != key and argument_name != to_string(key) ->
-        Atom.to_string(argument_name)
-
-      action_type in [:read, :create, :update, :destroy] ->
-        to_internal_field_key(resource, key)
-
-      true ->
-        key
+    case Map.fetch(reverse_argument_names(resource, action_name), to_string(key)) do
+      {:ok, argument_name} -> Atom.to_string(argument_name)
+      :error ->
+        if action_type in [:read, :create, :update, :destroy],
+          do: to_internal_field_key(resource, key), else: key
     end
   end
 

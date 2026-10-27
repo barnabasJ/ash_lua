@@ -37,6 +37,10 @@ defmodule AshLua.Runtime do
     * `:lua_options` — options passed to `Lua.new/1` when `:lua` is not supplied.
     * `:forbidden_fields` — `:hide` (default) strips fields hidden by authorization;
       `:display` renders them as the opaque marker `%{"opaque" => "forbidden"}`.
+    * `:require_pagination?` — when `true`, list reads on actions that support pagination
+      always return a page.
+    * `:default_page_size` — page size for `:require_pagination?` when neither `page.limit`
+      nor the action's `default_limit` is set. Defaults to `25`.
   """
   @spec build(keyword()) :: Lua.t()
   def build(opts) do
@@ -49,7 +53,9 @@ defmodule AshLua.Runtime do
         :manifest,
         :lua,
         :lua_options,
-        forbidden_fields: :hide
+        forbidden_fields: :hide,
+        require_pagination?: false,
+        default_page_size: 25
       ])
 
     manifest =
@@ -70,6 +76,8 @@ defmodule AshLua.Runtime do
       tenant: Keyword.get(opts, :tenant),
       context: Keyword.get(opts, :context, %{}),
       forbidden_fields: forbidden_fields_opt(opts),
+      require_pagination?: Keyword.fetch!(opts, :require_pagination?),
+      default_page_size: Keyword.fetch!(opts, :default_page_size),
       print_output: []
     }
 
@@ -570,47 +578,91 @@ defmodule AshLua.Runtime do
 
   defp build_action_callback(resource, action, manifest) do
     fn args, state ->
-      call_input = decode_call_args(state, args)
-
-      case split_call_input(call_input) do
-        {:ok, action_input, controls} ->
-          ash_opts = build_ash_opts(state)
-          {fields_input, controls} = Map.pop(controls, "fields")
-          {operation, controls} = Map.pop(controls, "operation")
-
-          controls = AshLua.FieldNames.to_internal_input(resource, action, controls)
-
-          action_input =
-            AshLua.FieldNames.to_internal_action_input(resource, action, action_input)
-
-          input = Map.merge(action_input, controls)
-          operation = AshLua.FieldNames.to_internal_operation(resource, operation)
-
-          cond do
-            is_nil(operation) ->
-              regular_call(resource, action, input, ash_opts, fields_input, manifest, state)
-
-            action.type == :read ->
-              operation_call(resource, action, input, ash_opts, operation, state)
-
-            true ->
-              t = Atom.to_string(action.type)
-
-              encode_error_response(
-                state,
-                %AshLua.Errors.FieldsError{
-                  message: "`operation` is only supported on list operations (this is `#{t}`)",
-                  short_message: "operation only on list operations",
-                  code: "operation_only_on_list_operations",
-                  fields: [],
-                  vars: %{"action_type" => t}
-                }
-              )
-          end
-
-        {:error, error} ->
-          encode_error_response(state, error)
+      try do
+        run_action_callback(resource, action, manifest, args, state)
+      rescue
+        exception ->
+          encode_host_exception(state, resource, action, exception, __STACKTRACE__)
       end
+    end
+  end
+
+  # A host exception that escapes the call — from query construction, the
+  # data layer, or a raise inside an action's own code — must never abort the
+  # script or reach it as text. It's rendered like any other failed call: as a
+  # `(nil, err)` return. Ash error classes (which is what Ash raises for
+  # exceptions inside actions) render through the normal per-leaf protocol;
+  # anything else becomes an opaque `unknown_error` whose uuid is logged with
+  # the full exception by the encoder.
+  defp encode_host_exception(state, resource, action, exception, stacktrace) do
+    error = Ash.Error.to_error_class(exception, stacktrace: stacktrace)
+    encode_action_error_response(state, resource, action, error)
+  end
+
+  defp run_action_callback(resource, action, manifest, args, state) do
+    call_input = decode_call_args(state, args)
+
+    case split_call_input(call_input) do
+      {:ok, action_input, controls} ->
+        ash_opts = build_ash_opts(state)
+        {fields_input, controls} = Map.pop(controls, "fields")
+        {operation, controls} = Map.pop(controls, "operation")
+
+        controls = AshLua.FieldNames.to_internal_input(resource, action, controls)
+
+        action_input =
+          AshLua.FieldNames.to_internal_action_input(resource, action, action_input)
+
+        raw_operation = operation
+        operation = AshLua.FieldNames.to_internal_operation(resource, operation)
+
+        cond do
+          is_nil(operation) ->
+            regular_call(
+              resource,
+              action,
+              action_input,
+              controls,
+              ash_opts,
+              fields_input,
+              manifest,
+              state
+            )
+
+          action.type == :read ->
+            case validate_operation_field(manifest, resource, action, raw_operation) do
+              :ok ->
+                operation_call(
+                  resource,
+                  action,
+                  action_input,
+                  controls,
+                  ash_opts,
+                  operation,
+                  state
+                )
+
+              {:error, reason} ->
+                encode_action_error_response(state, resource, action, reason)
+            end
+
+          true ->
+            t = Atom.to_string(action.type)
+
+            encode_error_response(
+              state,
+              %AshLua.Errors.FieldsError{
+                message: "`operation` is only supported on list operations (this is `#{t}`)",
+                short_message: "operation only on list operations",
+                code: "operation_only_on_list_operations",
+                fields: [],
+                vars: %{"action_type" => t}
+              }
+            )
+        end
+
+      {:error, error} ->
+        encode_error_response(state, error)
     end
   end
 
@@ -677,10 +729,12 @@ defmodule AshLua.Runtime do
     }
   end
 
-  defp regular_call(resource, action, input, ash_opts, fields_input, manifest, state) do
+  defp regular_call(resource, action, input, controls, ash_opts, fields_input, manifest, state) do
+    controls = maybe_require_page(controls, action, state)
+
     case AshLua.Fields.for_action(manifest, resource, action, fields_input) do
       {:ok, {select, load, template}} ->
-        case dispatch(resource, action, input, ash_opts, select, load) do
+        case dispatch(resource, action, input, controls, ash_opts, select, load) do
           {:ok, result} ->
             {encoded, state} =
               Lua.encode!(
@@ -702,8 +756,8 @@ defmodule AshLua.Runtime do
     end
   end
 
-  defp operation_call(resource, action, input, ash_opts, operation, state) do
-    case run_read_operation(resource, action, input, ash_opts, operation) do
+  defp operation_call(resource, action, input, controls, ash_opts, operation, state) do
+    case run_read_operation(resource, action, input, controls, ash_opts, operation) do
       {:ok, value} ->
         {encoded, state} =
           Lua.encode!(state, Encoder.encode_result(value, forbidden_fields_mode(state)))
@@ -723,6 +777,16 @@ defmodule AshLua.Runtime do
     {[nil, encoded], state}
   end
 
+  defp validate_operation_field(manifest, resource, action, [op, field])
+       when is_binary(op) and (is_binary(field) or is_atom(field)) do
+    case AshLua.Fields.for_action(manifest, resource, action, [field]) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp validate_operation_field(_manifest, _resource, _action, _operation), do: :ok
+
   defp encode_action_error_response(state, resource, action, error) do
     encoded_error =
       error
@@ -733,12 +797,8 @@ defmodule AshLua.Runtime do
     {[nil, encoded], state}
   end
 
-  defp run_read_operation(resource, action, input, opts, operation) do
-    {_page_opt, input} = pop_page_opt(input)
-    {filter, input} = Map.pop(input, "filter")
-    {sort, input} = Map.pop(input, "sort")
-    {limit, input} = Map.pop(input, "limit")
-    {offset, input} = Map.pop(input, "offset")
+  defp run_read_operation(resource, action, input, controls, opts, operation) do
+    %{filter: filter, sort: sort, limit: limit, offset: offset} = read_controls(controls)
 
     query =
       resource
@@ -748,7 +808,7 @@ defmodule AshLua.Runtime do
       |> maybe_limit(limit)
       |> maybe_offset(offset)
 
-    perform_operation(query, resource, operation, opts)
+    perform_operation(query, resource, operation, Keyword.put(opts, :authorize_fields?, true))
   end
 
   defp perform_operation(query, _resource, "count", opts) do
@@ -851,13 +911,23 @@ defmodule AshLua.Runtime do
     end
   end
 
-  defp dispatch(resource, %{type: :read} = action, input, opts, select, load) do
-    {page_opt, input} = pop_page_opt(input)
-    {filter, input} = Map.pop(input, "filter")
-    {sort, input} = Map.pop(input, "sort")
-    {limit, input} = Map.pop(input, "limit")
-    {offset, input} = Map.pop(input, "offset")
-    input = AshLua.FieldNames.to_internal_action_input(resource, action, input)
+  # Splits the reserved read controls out of the (already field-name-rewritten)
+  # controls map. Only ever reads control keys, never action input.
+  defp read_controls(controls) do
+    {page, controls} = pop_page_opt(controls)
+
+    %{
+      page: page,
+      filter: Map.get(controls, "filter"),
+      sort: Map.get(controls, "sort"),
+      limit: Map.get(controls, "limit"),
+      offset: Map.get(controls, "offset")
+    }
+  end
+
+  defp dispatch(resource, %{type: :read} = action, input, controls, opts, select, load) do
+    %{page: page_opt, filter: filter, sort: sort, limit: limit, offset: offset} =
+      read_controls(controls)
 
     query =
       resource
@@ -868,22 +938,16 @@ defmodule AshLua.Runtime do
       |> maybe_sort_input(sort)
       |> maybe_limit(limit)
       |> maybe_offset(offset)
+      |> maybe_page(page_opt)
 
-    cond do
-      action.get? ->
-        Ash.read_one(query, opts)
-
-      page_opt ->
-        Ash.read(query, Keyword.put(opts, :page, page_opt))
-
-      true ->
-        Ash.read(query, opts)
+    if action.get? do
+      Ash.read_one(query, opts)
+    else
+      Ash.read(query, opts)
     end
   end
 
-  defp dispatch(resource, %{type: :create} = action, input, opts, select, load) do
-    input = AshLua.FieldNames.to_internal_action_input(resource, action, input)
-
+  defp dispatch(resource, %{type: :create} = action, input, _controls, opts, select, load) do
     resource
     |> Ash.Changeset.for_create(action.name, input, opts)
     |> changeset_select(select)
@@ -891,8 +955,7 @@ defmodule AshLua.Runtime do
     |> Ash.create(opts)
   end
 
-  defp dispatch(resource, %{type: :update} = action, input, opts, select, load) do
-    input = AshLua.FieldNames.to_internal_action_input(resource, action, input)
+  defp dispatch(resource, %{type: :update} = action, input, _controls, opts, select, load) do
     {filter, input} = split_primary_key_filter(resource, input)
 
     bulk_extras =
@@ -906,8 +969,7 @@ defmodule AshLua.Runtime do
     |> unwrap_bulk_result(filter, resource)
   end
 
-  defp dispatch(resource, %{type: :destroy} = action, input, opts, select, load) do
-    input = AshLua.FieldNames.to_internal_action_input(resource, action, input)
+  defp dispatch(resource, %{type: :destroy} = action, input, _controls, opts, select, load) do
     {filter, input} = split_primary_key_filter(resource, input)
 
     bulk_extras =
@@ -921,9 +983,7 @@ defmodule AshLua.Runtime do
     |> unwrap_bulk_result(filter, resource)
   end
 
-  defp dispatch(resource, %{type: :action} = action, input, opts, _select, _load) do
-    input = AshLua.FieldNames.to_internal_action_input(resource, action, input)
-
+  defp dispatch(resource, %{type: :action} = action, input, _controls, opts, _select, _load) do
     resource
     |> Ash.ActionInput.for_action(action.name, input, opts)
     |> Ash.run_action(opts)
@@ -950,16 +1010,95 @@ defmodule AshLua.Runtime do
   defp append_if(list, true, item), do: list ++ [item]
 
   defp maybe_filter_input(query, nil), do: query
-  defp maybe_filter_input(query, filter), do: Ash.Query.filter_input(query, filter)
+
+  # `filter_input/2` reports most bad input on the query, but a malformed
+  # shape (an empty `or`, a non-table combinator, ...) can still raise from
+  # deep inside the filter parser. Treat any such raise as invalid input on
+  # `filter` rather than letting it escape to the script.
+  defp maybe_filter_input(query, filter) do
+    query
+    |> Ash.Query.filter_input(filter)
+    |> AshLua.QueryControlErrors.normalize_returned(query.errors, :filter, filter)
+  rescue
+    _exception ->
+      Ash.Query.add_error(query, :filter, %AshLua.Errors.FieldsError{
+        message: "invalid filter",
+        short_message: "invalid filter",
+        code: "invalid_filter",
+        fields: ["filter"],
+        vars: %{}
+      })
+  end
 
   defp maybe_sort_input(query, nil), do: query
-  defp maybe_sort_input(query, sort), do: Ash.Query.sort_input(query, sort)
+
+  defp maybe_sort_input(query, sort) do
+    query
+    |> Ash.Query.sort_input(sort)
+    |> AshLua.QueryControlErrors.normalize_returned(query.errors, :sort, sort)
+  rescue
+    _exception ->
+      Ash.Query.add_error(query, :sort, %AshLua.Errors.FieldsError{
+        message: "invalid sort",
+        short_message: "invalid sort",
+        code: "invalid_sort",
+        fields: ["sort"],
+        vars: %{}
+      })
+  end
 
   defp maybe_limit(query, nil), do: query
   defp maybe_limit(query, limit), do: Ash.Query.limit(query, limit)
 
   defp maybe_offset(query, nil), do: query
   defp maybe_offset(query, offset), do: Ash.Query.offset(query, offset)
+
+  # Applied on the query rather than passed as a read option so that invalid
+  # page options surface as `Ash.Error.Query.InvalidPage` (which has a Lua
+  # rendering) instead of an opaque options-validation error.
+  defp maybe_page(query, nil), do: query
+  defp maybe_page(query, page), do: Ash.Query.page(query, page)
+
+  defp maybe_require_page(
+         controls,
+         %{type: :read, get?: false, pagination: %{} = pagination},
+         state
+       ) do
+    case Lua.get_private(state, @private_key) do
+      {:ok, %{require_pagination?: true, default_page_size: default_page_size}} ->
+        limit = pagination.default_limit || default_page_size
+        require_page(controls, pagination, limit)
+
+      _ ->
+        controls
+    end
+  end
+
+  defp maybe_require_page(controls, _action, _state), do: controls
+
+  defp require_page(%{"page" => page} = controls, _pagination, limit) when is_map(page) do
+    %{controls | "page" => Map.put_new(page, "limit", limit)}
+  end
+
+  defp require_page(%{"page" => page} = controls, _pagination, limit) when is_list(page) do
+    %{controls | "page" => Keyword.put_new(page, :limit, limit)}
+  end
+
+  defp require_page(controls, pagination, limit) do
+    {page_limit, controls} = Map.pop(controls, "limit")
+
+    {page, controls} =
+      if pagination.offset? do
+        {offset, controls} = Map.pop(controls, "offset")
+        {%{"limit" => page_limit || limit, "offset" => offset}, controls}
+      else
+        {%{"limit" => page_limit || limit}, controls}
+      end
+
+    Map.put(controls, "page", reject_nil_values(page))
+  end
+
+  defp reject_nil_values(map), do: Map.reject(map, fn {_key, value} -> is_nil(value) end)
 
   defp pop_page_opt(input) do
     case Map.pop(input, "page") do
